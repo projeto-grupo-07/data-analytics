@@ -11,60 +11,129 @@ Variáveis de ambiente:
 """
 
 import os
-import io
-import csv
 import time
 import json
 import logging
+import boto3
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
-import boto3
 
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+
 
 BASE_URL = "https://www.gov.br/receitafederal/dados/estatisticas_di_{codigo}.csv/@@download/file"
+
+
+def carregar_env_local(caminhos_relativos=(".env", "etl/.env")):
+    """Carrega variaveis de ambiente de um arquivo .env local, se existir."""
+    for caminho_relativo in caminhos_relativos:
+        arquivo_env = Path(__file__).resolve().parent / caminho_relativo
+        if not arquivo_env.exists():
+            continue
+
+        with arquivo_env.open(encoding="utf-8") as arquivo:
+            for linha in arquivo:
+                linha = linha.strip()
+                if not linha or linha.startswith("#") or "=" not in linha:
+                    continue
+
+                chave, valor = linha.split("=", 1)
+                chave = chave.strip()
+                valor = valor.strip().strip('"').strip("'")
+
+                if chave and chave not in os.environ:
+                    os.environ[chave] = valor
+
+        break
+
+
+carregar_env_local()
+
 S3_BUCKET = os.environ.get("S3_BUCKET", "meu-bucket-raw")
-S3_PREFIX = os.environ.get("S3_PREFIX", "importacao/consolidado")
-ANO_INICIO = int(os.environ.get("ANO_INICIO", "2021"))
-MES_INICIO = int(os.environ.get("MES_INICIO", "5"))
-MODO = os.environ.get("MODO", "incremental")  # "full" ou "incremental"
+S3_PREFIX = os.environ.get("S3_PREFIX", "importacao")
+MESES_ATRAS = int(os.environ.get("MESES_ATRAS", "2"))
+
+# BASE_URL = "https://www.gov.br/receitafederal/dados/estatisticas_di_{codigo}.csv/@@download/file"
+# S3_BUCKET = "brinks-bucket-raw"
+# S3_PREFIX = "importacao"
+# ANO_INICIO = 2021
+# MES_INICIO = 5
+
+
+def obter_request_id(context):
+    """Retorna o request_id da Lambda quando disponivel."""
+    if context is None:
+        return None
+    if isinstance(context, dict):
+        return context.get("aws_request_id") or context.get("request_id")
+    return getattr(context, "aws_request_id", None)
+
+
+def formatar_duracao(segundos):
+    """Formata duracao em segundos com 3 casas decimais."""
+    return f"{segundos:.3f}s"
 
 
 def gerar_codigos():
-    """Gera lista de códigos ano_mes conforme o MODO."""
-    hoje = datetime.today()
+    """Gera o codigo do mes configurado por atraso em relacao ao UTC atual."""
+    logger.info("Função gerar_codigos() - iniciada")
 
-    if MODO == "incremental":
-        # Só o mês anterior (mais seguro, dados do mês atual podem estar incompletos)
-        if hoje.month == 1:
-            return [f"{hoje.year - 1}_12"]
-        return [f"{hoje.year}_{hoje.month - 1:02d}"]
+    hoje = datetime.now(timezone.utc)
+    ano_ref = hoje.year
+    mes_ref = hoje.month - MESES_ATRAS
 
-    # MODO full: todos os meses desde ANO_INICIO/MES_INICIO
-    codigos = []
-    for ano in range(ANO_INICIO, hoje.year + 1):
-        mes_ini = MES_INICIO if ano == ANO_INICIO else 1
-        mes_fim = hoje.month - 1 if ano == hoje.year else 12
-        for mes in range(mes_ini, mes_fim + 1):
-            codigos.append(f"{ano}_{mes:02d}")
-    return codigos
+    while mes_ref <= 0:
+        mes_ref += 12
+        ano_ref -= 1
+
+    codigos = [f"{ano_ref}_{mes_ref:02d}"]
+
+    logger.info("Códigos gerados (MESES_ATRAS=%s): %s", MESES_ATRAS, codigos)
+    return codigos, ano_ref, mes_ref
 
 
-def baixar_csv(codigo, tentativas=3):
-    """Baixa um CSV da RFB. Retorna bytes ou None."""
+def baixar_e_salvar_stream(codigo, ano_ref, mes_ref, tentativas=3):
+    """Baixa o CSV da RFB via streaming e salva diretamente no S3."""
+    logger.info(f"Função baixar_e_salvar_stream() - iniciada para {codigo}")
+    s3 = boto3.client("s3")
     url = BASE_URL.format(codigo=codigo)
+    
+    hoje = datetime.now(timezone.utc)
+    nome_arquivo = f"estatisticas_di_{codigo}.csv"
+    s3_key = f"{S3_PREFIX}/ano={ano_ref}/mes={mes_ref:02d}/{nome_arquivo}"
+
     for i in range(tentativas):
         try:
-            req = urllib.request.Request(url, headers={"Accept": "text/csv", "User-Agent": "Mozilla/5.0"})
+            logger.info(f"Tentativa {i+1}/{tentativas} para {codigo} | url={url}")
+            req = urllib.request.Request(
+                url, headers={"Accept": "text/csv", "User-Agent": "Mozilla/5.0"}
+            )
+            
+            # Com o 'with', a conexão fica aberta. NÃO usamos .read() aqui.
             with urllib.request.urlopen(req, timeout=60) as resp:
                 if resp.status == 200:
-                    conteudo = resp.read()
-                    if len(conteudo) > 100:
-                        logger.info(f"✓ {codigo} ({len(conteudo) // 1024} KB)")
-                        return conteudo
+                    # O S3 puxa os dados do 'resp' diretamente, aos poucos.
+                    s3.upload_fileobj(
+                        resp, 
+                        S3_BUCKET, 
+                        s3_key,
+                        ExtraArgs={
+                            "ContentType": "text/csv",
+                            "Metadata": {
+                                "codigo": codigo,
+                                "origem": "rfb",
+                                "gerado_em": hoje.isoformat()
+                            }
+                        }
+                    )
+                    logger.info("✓ Salvo via streaming no S3: s3://%s/%s", S3_BUCKET, s3_key)
+                    return s3_key
+                    
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 logger.info(f"- {codigo} não encontrado (404)")
@@ -73,108 +142,112 @@ def baixar_csv(codigo, tentativas=3):
         except Exception as e:
             logger.warning(f"! {codigo} erro: {e}, tentativa {i+1}")
         time.sleep(2)
+        
     return None
 
 
-def parsear_csv(conteudo_bytes, codigo):
-    """Parseia CSV com separador @ e adiciona coluna ano_mes."""
-    linhas = []
-    texto = conteudo_bytes.decode("utf-8", errors="replace")
-    reader = csv.reader(io.StringIO(texto), delimiter="@")
-    cabecalho = None
-    for i, row in enumerate(reader):
-        if i == 0:
-            cabecalho = ["ano_mes"] + row
-            continue
-        if row:
-            linhas.append([codigo] + row)
-    return cabecalho, linhas
-
-
-def consolidar_e_salvar_s3(dfs_data):
-    """
-    dfs_data: list of (cabecalho, linhas)
-    Gera CSV em memória e faz upload para S3.
-    """
+def salvar_raw_s3(codigo, conteudo_bytes, ano_ref, mes_ref):
     s3 = boto3.client("s3")
-    buffer = io.StringIO()
-    writer = csv.writer(buffer, delimiter=";")
+    hoje = datetime.now(timezone.utc)
+    nome_arquivo = f"estatisticas_di_{codigo}.csv"
+    s3_key = f"{S3_PREFIX}/ano={ano_ref}/mes={mes_ref:02d}/{nome_arquivo}" 
 
-    cabecalho_escrito = False
-    total_linhas = 0
-
-    for cabecalho, linhas in dfs_data:
-        if not cabecalho_escrito:
-            writer.writerow(cabecalho)
-            cabecalho_escrito = True
-        writer.writerows(linhas)
-        total_linhas += len(linhas)
-
-    hoje = datetime.today()
-    if MODO == "incremental":
-        nome_arquivo = f"importacao_{hoje.year}_{hoje.month - 1:02d}.csv"
-    else:
-        nome_arquivo = f"importacao_consolidado_full_{hoje.strftime('%Y%m%d')}.csv"
-
-    s3_key = f"{S3_PREFIX}/{nome_arquivo}"
-
-    conteudo_bytes = buffer.getvalue().encode("utf-8-sig")
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=s3_key,
         Body=conteudo_bytes,
         ContentType="text/csv",
         Metadata={
-            "total_linhas": str(total_linhas),
-            "gerado_em": hoje.isoformat(),
-            "modo": MODO,
+            "codigo": codigo,
+            "origem": "rfb",
+            "gerado_em": hoje.isoformat()
         },
     )
-
-    logger.info(f"✓ Salvo no S3: s3://{S3_BUCKET}/{s3_key} ({total_linhas:,} linhas)")
-    return s3_key, total_linhas
+    logger.info("Salvo raw no S3: s3://%s/%s", S3_BUCKET, s3_key)
+    return s3_key
 
 
 def lambda_handler(event, context):
-    logger.info(f"Iniciando | MODO={MODO} | BUCKET={S3_BUCKET} | PREFIX={S3_PREFIX}")
+    inicio_total = time.perf_counter()
+    request_id = obter_request_id(context)
+    logger.info(
+        "Iniciando | request_id=%s | BUCKET=%s | PREFIX=%s | event_type=%s | event_keys=%s",
+        request_id,
+        S3_BUCKET,
+        S3_PREFIX,
+        type(event).__name__,
+        list(event.keys()) if isinstance(event, dict) else None,
+    )
 
-    codigos = gerar_codigos()
-    logger.info(f"Meses a processar: {codigos}")
+    inicio_codigos = time.perf_counter()
+    codigos, ano_ref, mes_ref = gerar_codigos()
+    logger.info(
+        "Meses a processar: %s | total=%s | tempo=%s",
+        codigos,
+        len(codigos),
+        formatar_duracao(time.perf_counter() - inicio_codigos),
+    )
 
-    dfs_data = []
+    s3_keys = []
     baixados = []
     nao_encontrados = []
 
-    for codigo in codigos:
-        conteudo = baixar_csv(codigo)
-        if conteudo:
-            try:
-                cabecalho, linhas = parsear_csv(conteudo, codigo)
-                dfs_data.append((cabecalho, linhas))
-                baixados.append(codigo)
-            except Exception as e:
-                logger.error(f"Erro ao parsear {codigo}: {e}")
+    inicio_downloads = time.perf_counter()
+    for indice, codigo in enumerate(codigos, start=1):
+        logger.info("Processando arquivo %s/%s | codigo=%s", indice, len(codigos), codigo)
+
+        # Chama a função unificada de download e upload via streaming
+        s3_key = baixar_e_salvar_stream(codigo, ano_ref, mes_ref)
+        
+        if s3_key:
+            s3_keys.append(s3_key)
+            baixados.append(codigo)
         else:
             nao_encontrados.append(codigo)
+
         time.sleep(0.5)
 
-    if not dfs_data:
-        msg = "Nenhum arquivo baixado com sucesso."
-        logger.error(msg)
-        return {"statusCode": 404, "body": msg}
+    logger.info(
+        "Etapa finalizada | baixados=%s | nao_encontrados=%s | salvos_s3=%s | tempo_total=%s",
+        len(baixados),
+        len(nao_encontrados),
+        len(s3_keys),
+        formatar_duracao(time.perf_counter() - inicio_downloads),
+    )
 
-    s3_key, total_linhas = consolidar_e_salvar_s3(dfs_data)
+    if not s3_keys:
+        msg = "Nenhum arquivo baixado/salvo"
+        logger.error("%s | request_id=%s", msg, request_id)
+        return {"statusCode": 404, "body": msg}
 
     resultado = {
         "statusCode": 200,
-        "body": json.dumps({
-            "s3_uri": f"s3://{S3_BUCKET}/{s3_key}",
-            "baixados": baixados,
-            "nao_encontrados": nao_encontrados,
-            "total_linhas": total_linhas,
-            "modo": MODO,
-        }, ensure_ascii=False),
+        "body": json.dumps(
+            {
+                "bucket": S3_BUCKET,
+                "prefixo": S3_PREFIX,
+                "arquivos_salvos": s3_keys,
+                "baixados": baixados,
+                "nao_encontrados": nao_encontrados,
+            },
+            ensure_ascii=False,
+        ),
     }
 
-    logger.info(f"Resultado: {resultado}")
+    logger.info(
+        "Resultado final | request_id=%s | status=%s | baixados=%s | nao_encontrados=%s | salvos_s3=%s | duracao_total=%s",
+        request_id,
+        resultado.get("statusCode"),
+        len(baixados),
+        len(nao_encontrados),
+        len(s3_keys),
+        formatar_duracao(time.perf_counter() - inicio_total),
+    )
     return resultado
+
+
+if __name__ == "__main__":    # Para testes locais
+    logger.info("Executando lambda_handler()")
+    resultado = lambda_handler({}, {})
+    logger.info("Resultado da execução local:")
+    print(json.dumps(resultado, indent=2, ensure_ascii=False))
