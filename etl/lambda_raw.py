@@ -58,13 +58,6 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "meu-bucket-raw")
 S3_PREFIX = os.environ.get("S3_PREFIX", "importacao")
 MESES_ATRAS = int(os.environ.get("MESES_ATRAS", "2"))
 
-# BASE_URL = "https://www.gov.br/receitafederal/dados/estatisticas_di_{codigo}.csv/@@download/file"
-# S3_BUCKET = "brinks-bucket-raw"
-# S3_PREFIX = "importacao"
-# ANO_INICIO = 2021
-# MES_INICIO = 5
-
-
 def obter_request_id(context):
     """Retorna o request_id da Lambda quando disponivel."""
     if context is None:
@@ -114,10 +107,8 @@ def baixar_e_salvar_stream(codigo, ano_ref, mes_ref, tentativas=3):
                 url, headers={"Accept": "text/csv", "User-Agent": "Mozilla/5.0"}
             )
             
-            # Com o 'with', a conexão fica aberta. NÃO usamos .read() aqui.
             with urllib.request.urlopen(req, timeout=60) as resp:
                 if resp.status == 200:
-                    # O S3 puxa os dados do 'resp' diretamente, aos poucos.
                     s3.upload_fileobj(
                         resp, 
                         S3_BUCKET, 
