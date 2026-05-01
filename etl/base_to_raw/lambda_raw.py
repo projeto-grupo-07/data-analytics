@@ -14,18 +14,26 @@ s3_client = boto3.client("s3")
 
 BASE_URL = "https://www.gov.br/receitafederal/dados/estatisticas_di_{codigo}.csv/@@download/file"
 
-def obter_parametros_data(meses_atras):
-    """Calcula o ano, mês e o código de referência com base no atraso configurado."""
-    hoje = datetime.now(timezone.utc)
-    ano_ref = hoje.year
-    mes_ref = hoje.month - meses_atras
 
-    while mes_ref <= 0:
-        mes_ref += 12
-        ano_ref -= 1
+def obter_parametros_data(event):
+    """Extrai ano e mês do corpo do POST (JSON)."""
+    body_raw = event.get('body', '{}')
+    if isinstance(body_raw, str):
+        body = json.loads(body_raw)
+    else:
+        body = body_raw
 
-    codigo = f"{ano_ref}_{mes_ref:02d}"
-    return [codigo], ano_ref, mes_ref
+    ano = body.get('ano', datetime.now().year)
+    mes = body.get('mes', datetime.now().month)
+
+    try:
+        ano_int = int(ano)
+        mes_int = int(mes)
+        codigo = f"{ano_int}_{mes_int:02d}"
+        return [codigo], ano_int, mes_int
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"Parâmetros inválidos: ano={ano}, mes={mes}. Devem ser números.")
 
 
 def transferir_rfb_para_s3(codigo, ano_ref, mes_ref, bucket, prefixo, tentativas=3):
@@ -36,14 +44,26 @@ def transferir_rfb_para_s3(codigo, ano_ref, mes_ref, bucket, prefixo, tentativas
 
     for tentativa in range(1, tentativas + 1):
         try:
-            logger.info(f"Transferindo {codigo} (Tentativa {tentativa}/{tentativas})")
-            req = urllib.request.Request(url, headers={"Accept": "text/csv", "User-Agent": "Mozilla/5.0"})
-            
+            logger.info(
+                f"Transferindo {codigo} (Tentativa {tentativa}/{tentativas})")
+            # Log da URL solicitada para facilitar rastreamento no CloudWatch
+            logger.info(
+                f"Solicitando URL: {url} | codigo={codigo} | tentativa={tentativa}")
+            req = urllib.request.Request(
+                url, headers={"Accept": "text/csv", "User-Agent": "Mozilla/5.0"})
+
             with urllib.request.urlopen(req, timeout=60) as response:
+                logger.info(
+                    f"Resposta HTTP {getattr(response, 'status', 'unknown')} recebida para URL: {url}")
+                content_length = response.getheader(
+                    'Content-Length') if hasattr(response, 'getheader') else None
+                if content_length:
+                    logger.info(
+                        f"Content-Length: {content_length} | URL: {url}")
                 if response.status == 200:
                     s3_client.upload_fileobj(
-                        response, 
-                        bucket, 
+                        response,
+                        bucket,
                         s3_key,
                         ExtraArgs={
                             "ContentType": "text/csv",
@@ -55,47 +75,48 @@ def transferir_rfb_para_s3(codigo, ano_ref, mes_ref, bucket, prefixo, tentativas
                         }
                     )
                     return s3_key
-                    
+
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                logger.warning(f"Arquivo {codigo} não encontrado (404).")
+                logger.warning(
+                    f"Arquivo {codigo} não encontrado (404). URL: {url}")
                 return None
-            logger.error(f"Erro HTTP {e.code} ao acessar {url}")
+            logger.error(f"Erro HTTP {e.code} ao acessar {url}: {e}")
         except Exception as e:
-            logger.error(f"Erro inesperado na tentativa {tentativa}: {str(e)}")
-            
+            logger.error(
+                f"Erro inesperado na tentativa {tentativa} ao acessar {url}: {str(e)}")
+
         time.sleep(2)
-        
+
     return None
 
+
 def lambda_handler(event, context):
-    """Orquestra a extração validando as dependências primeiro."""
     inicio_total = time.perf_counter()
-    request_id = context.aws_request_id if hasattr(context, 'aws_request_id') else "local-test"
-    
+
     try:
-        # 1. Validação de Ambiente
+        # 1. Validação de Ambiente (Apenas Bucket e Prefixo)
         s3_bucket = os.environ.get("S3_BUCKET")
         s3_prefix = os.environ.get("S3_PREFIX")
-        meses_atras_str = os.environ.get("MESES_ATRAS")
 
-        if not s3_bucket or not s3_prefix or not meses_atras_str:
-            raise ValueError("As variáveis S3_BUCKET, S3_PREFIX e MESES_ATRAS não estão configuradas no Terraform.")
+        if not s3_bucket or not s3_prefix:
+            raise ValueError(
+                "As variáveis S3_BUCKET e S3_PREFIX não estão configuradas.")
 
-        meses_atras = int(meses_atras_str)
-        
-        logger.info(f"Iniciando Extração | RequestID: {request_id} | Bucket: {s3_bucket}")
+        # 2. Definição do período via POST
+        # Agora passamos o 'event' diretamente
+        codigos, ano_ref, mes_ref = obter_parametros_data(event)
 
-        # 2. Definição do período
-        codigos, ano_ref, mes_ref = obter_parametros_data(meses_atras)
-        
+        logger.info(
+            f"Iniciando Extração para {ano_ref}/{mes_ref} no Bucket: {s3_bucket}")
+
         arquivos_salvos = []
         arquivos_falhos = []
 
         # 3. Extração e Carga
         for codigo in codigos:
-            s3_key = transferir_rfb_para_s3(codigo, ano_ref, mes_ref, s3_bucket, s3_prefix)
-            
+            s3_key = transferir_rfb_para_s3(
+                codigo, ano_ref, mes_ref, s3_bucket, s3_prefix)
             if s3_key:
                 arquivos_salvos.append(s3_key)
             else:
@@ -105,24 +126,23 @@ def lambda_handler(event, context):
 
         # 4. Resposta
         if not arquivos_salvos:
-            mensagem = "Nenhum arquivo foi transferido para o S3."
-            logger.error(mensagem)
-            return {"statusCode": 404, "body": json.dumps({"erro": mensagem})}
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"erro": f"Arquivo {codigos[0]} não encontrado na Receita."})
+            }
 
-        resultado = {
+        return {
             "statusCode": 200,
             "body": json.dumps({
-                "mensagem": "Extração RAW concluída",
-                "bucket": s3_bucket,
-                "salvos": arquivos_salvos,
-                "falhas": arquivos_falhos,
-                "duracao_segundos": round(duracao, 2)
-            }, ensure_ascii=False)
+                "status": "sucesso",
+                "arquivos": arquivos_salvos,
+                "tempo_execucao": f"{duracao:.2f}s"
+            })
         }
-        
-        logger.info(f"Finalizado em {duracao:.2f}s | Salvos: {len(arquivos_salvos)} | Falhas: {len(arquivos_falhos)}")
-        return resultado
 
     except Exception as e:
-        logger.exception(f"Erro crítico na execução: {str(e)}")
-        raise e
+        logger.exception("Erro crítico")
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"erro": str(e)})
+        }
